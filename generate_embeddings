@@ -21,6 +21,9 @@ Options:
                Ignored when generating an embedding from text arguments.
   --daemon [N] Start a Unix-socket daemon at ~/.cache/generate_embeddings/daemon.sock;
                N is its lifetime in minutes (default: 0, unlimited).
+
+Normal invocations reuse the daemon when available, or start one with a 1-minute
+lifetime before sending the embedding request.
   --           Treat all following arguments literally as text.
   --help       Show this help message.
   --version    Show version information.
@@ -134,9 +137,25 @@ SOCKET_PATH = Path.home() / '.cache' / 'generate_embeddings' / 'daemon.sock'
 class IdleSocketServer(socketserver.UnixStreamServer):
     allow_reuse_address = True
 
-class NoopHandler(socketserver.StreamRequestHandler):
+MODEL = None
+
+class EmbeddingHandler(socketserver.StreamRequestHandler):
     def handle(self):
-        pass
+        global MODEL
+        try:
+            line = self.rfile.readline()
+            if not line:
+                return
+            request = json.loads(line)
+            if not isinstance(request.get('text'), str):
+                raise ValueError('request must contain string field "text"')
+            if MODEL is None:
+                MODEL = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')
+            embedding = MODEL.encode([request['text']], show_progress_bar=False)[0]
+            response = {'embedding': embedding.tolist() if hasattr(embedding, 'tolist') else list(embedding)}
+        except Exception as error:
+            response = {'error': str(error)}
+        self.wfile.write((json.dumps(response) + '\n').encode('utf-8'))
 
 def start_daemon():
     SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -161,7 +180,8 @@ def start_daemon():
                 probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 probe.connect(str(SOCKET_PATH))
                 probe.close()
-                print(f"Daemon started at {SOCKET_PATH}")
+                if os.environ.get('EMBEDDING_DAEMON_QUIET') != '1':
+                    print(f"Daemon started at {SOCKET_PATH}")
                 return
             except OSError:
                 time.sleep(0.05)
@@ -182,7 +202,7 @@ def start_daemon():
             os.dup2(null.fileno(), 0)
             os.dup2(null.fileno(), 1)
             os.dup2(null.fileno(), 2)
-        server = IdleSocketServer(str(SOCKET_PATH), NoopHandler)
+        server = IdleSocketServer(str(SOCKET_PATH), EmbeddingHandler)
         server.timeout = 1
         lifetime = int(os.environ.get('EMBEDDING_DAEMON_MINUTES', '0'))
         end_time = time.monotonic() + lifetime * 60 if lifetime else None
@@ -194,6 +214,42 @@ def start_daemon():
         if SOCKET_PATH.exists() and SOCKET_PATH.is_socket():
             SOCKET_PATH.unlink()
     os._exit(0)
+
+def request_embedding(text):
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(5)
+    client.connect(str(SOCKET_PATH))
+    with client, client.makefile('rwb') as channel:
+        channel.write((json.dumps({'text': text}) + '\n').encode('utf-8'))
+        channel.flush()
+        response = json.loads(channel.readline())
+    if 'error' in response:
+        raise RuntimeError(response['error'])
+    return response['embedding']
+
+def ensure_daemon():
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.connect(str(SOCKET_PATH))
+        probe.close()
+        return
+    except OSError:
+        probe.close()
+    os.environ['EMBEDDING_DAEMON'] = '1'
+    os.environ['EMBEDDING_DAEMON_MINUTES'] = '1'
+    os.environ['EMBEDDING_DAEMON_QUIET'] = '1'
+    start_daemon()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.connect(str(SOCKET_PATH))
+            probe.close()
+            return
+        except OSError:
+            probe.close()
+            time.sleep(0.05)
+    raise RuntimeError('Daemon failed to become available')
 
 def main():
     if os.environ.get('EMBEDDING_DAEMON') == '1':
@@ -223,15 +279,11 @@ def main():
         sys.exit(0)
 
     try:
-        # Load model on CPU
-        model = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')
-        
-        # Compute embeddings, suppressing progress bar
-        embeddings = model.encode(texts, show_progress_bar=False)
-        
-        for embedding in embeddings:
+        ensure_daemon()
+        for text in texts:
+            embedding = request_embedding(text)
             if use_json:
-                print(json.dumps(embedding.tolist()))
+                print(json.dumps(embedding))
             else:
                 print(" ".join(map(str, embedding)))
             
