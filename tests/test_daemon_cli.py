@@ -43,11 +43,15 @@ class DaemonCliTest(unittest.TestCase):
         uv.write_text(
             "#!/usr/bin/env bash\n"
             "set -e\n"
-            "[[ $1 == run && $2 == --script && $3 == - ]]\n"
-            "shift 3\n"
-            "script=$(mktemp)\n"
-            "trap 'rm -f \"$script\"' EXIT\n"
-            "cat > \"$script\"\n"
+            "[[ $1 == run && $2 == --script ]]\n"
+            "shift 2\n"
+            "script=$1; shift\n"
+            "echo \"$script\" >> \"$UV_SEEN\"\n"
+            "if [[ $script == - ]]; then\n"
+            "  script=$(mktemp)\n"
+            "  trap 'rm -f \"$script\"' EXIT\n"
+            "  cat > \"$script\"\n"
+            "fi\n"
             "exec python3 \"$script\" \"$@\"\n"
         )
         uv.chmod(0o755)
@@ -56,6 +60,7 @@ class DaemonCliTest(unittest.TestCase):
             HOME=str(self.home),
             PATH=f"{self.bin}:{os.environ['PATH']}",
             PYTHONPATH=str(self.pythonpath),
+            UV_SEEN=str(self.home / "uv-seen"),
         )
         self.sock = self.home / ".cache/generate_embeddings/daemon.sock"
 
@@ -73,6 +78,11 @@ class DaemonCliTest(unittest.TestCase):
             [str(ROOT / "generate_embeddings.daemon"), *args], env=self.env,
             text=True, capture_output=True, timeout=15,
         )
+
+    def test_cli_executes_through_uv_script_shebang(self):
+        result = self.run_cli("--help")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(str(SCRIPT), Path(self.env["UV_SEEN"]).read_text())
 
     def test_existing_daemon_receives_text_request(self):
         self.sock.parent.mkdir(parents=True)
@@ -128,6 +138,17 @@ class DaemonCliTest(unittest.TestCase):
                 deadline = time.monotonic() + 5
                 while self.sock.exists() and time.monotonic() < deadline:
                     time.sleep(0.05)
+
+    def test_stop_stops_running_daemon_and_removes_socket(self):
+        started = self.run_daemon("--timeout", "10")
+        self.assertEqual(started.returncode, 0, started.stderr)
+        pid = self.daemon_pid()
+        self.assertIsNotNone(pid)
+        stopped = self.run_daemon("--stop")
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        self.assertFalse(self.sock.exists())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
 
     def test_missing_daemon_starts_and_handles_request(self):
         try:

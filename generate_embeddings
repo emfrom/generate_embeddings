@@ -1,12 +1,21 @@
-#!/usr/bin/env bash
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# ///
+"""Generate text embeddings through the local embedding daemon."""
 
-set -e
-VERSION="1.0.0"
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
 
-show_help() {
-    cat << EOF
-Usage: ./generate_embeddings [OPTIONS] [TEXT...]
+SOCKET_PATH = Path.home() / ".cache" / "generate_embeddings" / "daemon.sock"
+DAEMON_SCRIPT = Path(__file__).with_name("generate_embeddings.daemon")
+
+HELP = """Usage: ./generate_embeddings [OPTIONS] [TEXT...]
 
 Generates embeddings using all-MiniLM-L6-v2. Normal invocations reuse the
 Unix-socket daemon, or start one with a 1-minute timeout if none is available.
@@ -19,130 +28,108 @@ Options:
   --            Treat following arguments literally as text.
   --help        Show this help.
   --version     Show version.
-EOF
-}
+"""
 
-use_json=0
-use_stdin=0
-use_nul=0
-daemon=0
-daemon_minutes=0
-text_args=()
-while (($#)); do
-    case "$1" in
-        --) shift; text_args+=("$@"); break ;;
-        --help) show_help; exit 0 ;;
-        --version) echo "$VERSION"; exit 0 ;;
-        --json) use_json=1 ;;
-        -0) use_nul=1 ;;
-        --daemon)
-            daemon=1
-            if (($# > 1)) && [[ "$2" =~ ^[0-9]+$ ]]; then daemon_minutes="$2"; shift; fi
-            ;;
-        -) use_stdin=1 ;;
-        *) text_args+=("$1") ;;
-    esac
-    shift
-done
 
-if ((daemon)); then
-    exec "$SCRIPT_DIR/generate_embeddings.daemon" --timeout "$daemon_minutes"
-fi
+def parse_args(args):
+    use_json = False
+    use_stdin = False
+    use_nul = False
+    daemon_minutes = None
+    text_args = []
+    while args:
+        arg = args.pop(0)
+        if arg == "--":
+            text_args.extend(args)
+            break
+        if arg == "--help":
+            print(HELP, end="")
+            raise SystemExit(0)
+        if arg == "--version":
+            print("1.0.0")
+            raise SystemExit(0)
+        if arg == "--json":
+            use_json = True
+        elif arg == "-0":
+            use_nul = True
+        elif arg == "-":
+            use_stdin = True
+        elif arg == "--daemon":
+            daemon_minutes = 0
+            if args and args[0].isdigit():
+                daemon_minutes = int(args.pop(0))
+        else:
+            text_args.append(arg)
+    return use_json, use_stdin, use_nul, daemon_minutes, text_args
 
-input_file=""
-if ((use_stdin)); then
-    if ((${#text_args[@]} > 0)); then
-        echo "Error: '-' cannot be combined with text arguments; use '--' to pass a literal '-'." >&2
-        exit 2
-    fi
-    input_file=$(mktemp)
-    trap 'rm -f "$input_file"' EXIT
-    cat > "$input_file"
-    export EMBEDDING_INPUT_FILE="$input_file"
-fi
-export EMBEDDING_USE_JSON="$use_json"
-export EMBEDDING_USE_NUL="$use_nul"
-export EMBEDDING_DAEMON_SCRIPT="$SCRIPT_DIR/generate_embeddings.daemon"
-
-if ! command -v uv >/dev/null 2>&1; then
-    echo "Error: 'uv' is not installed. Please install it from https://github.com/astral-sh/uv" >&2
-    exit 1
-fi
-
-uv run --script - "${text_args[@]}" << 'EOF'
-# /// script
-# requires-python = ">=3.11"
-# ///
-import json
-import os
-import socket
-import subprocess
-import sys
-import time
-from pathlib import Path
-
-SOCKET_PATH = Path.home() / '.cache' / 'generate_embeddings' / 'daemon.sock'
 
 def connect_to_daemon():
-    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        probe.connect(str(SOCKET_PATH))
-        probe.close()
+    def available():
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                probe.connect(str(SOCKET_PATH))
+            return True
+        except OSError:
+            return False
+
+    if available():
         return
-    except OSError:
-        probe.close()
-    subprocess.run([os.environ['EMBEDDING_DAEMON_SCRIPT'], '--timeout', '1'],
-                   stdout=subprocess.DEVNULL, check=False)
+    subprocess.run(
+        [str(DAEMON_SCRIPT), "--timeout", "1"],
+        stdout=subprocess.DEVNULL,
+        check=False,
+    )
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
-        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            probe.connect(str(SOCKET_PATH))
-            probe.close()
+        if available():
             return
-        except OSError:
-            probe.close()
-            time.sleep(0.05)
-    raise RuntimeError('Could not start embedding daemon')
+        time.sleep(0.05)
+    raise RuntimeError("Could not start embedding daemon")
+
 
 def request_embedding(text):
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.settimeout(120)
         client.connect(str(SOCKET_PATH))
-        with client.makefile('rwb') as channel:
-            channel.write((json.dumps({'text': text}) + '\n').encode('utf-8'))
+        with client.makefile("rwb") as channel:
+            channel.write((json.dumps({"text": text}) + "\n").encode("utf-8"))
             channel.flush()
             response = json.loads(channel.readline())
-    if 'error' in response:
-        raise RuntimeError(response['error'])
-    return response['embedding']
+    if "error" in response:
+        raise RuntimeError(response["error"])
+    return response["embedding"]
+
 
 def main():
-    texts_args = sys.argv[1:]
-    input_file = os.environ.get('EMBEDDING_INPUT_FILE')
-    if input_file:
-        raw = Path(input_file).read_bytes()
-        if os.environ.get('EMBEDDING_USE_NUL') == '1':
-            texts = raw.decode('utf-8').split('\0')
-            if raw.endswith(b'\0'):
+    use_json, use_stdin, use_nul, daemon_minutes, text_args = parse_args(sys.argv[1:])
+    if daemon_minutes is not None:
+        subprocess.run([str(DAEMON_SCRIPT), "--timeout", str(daemon_minutes)], check=False)
+        return 0
+    if use_stdin and text_args:
+        print("Error: '-' cannot be combined with text arguments; use '--' to pass a literal '-'.", file=sys.stderr)
+        return 2
+    if use_stdin:
+        raw = sys.stdin.buffer.read()
+        if use_nul:
+            texts = raw.decode("utf-8").split("\0")
+            if raw.endswith(b"\0"):
                 texts.pop()
         else:
-            texts = [raw.decode('utf-8').strip()]
+            texts = [raw.decode("utf-8").strip()]
     else:
-        texts = [' '.join(texts_args)]
+        texts = [" ".join(text_args)]
     if not texts or (len(texts) == 1 and not texts[0]):
-        return
+        return 0
     connect_to_daemon()
     for text in texts:
         embedding = request_embedding(text)
-        if os.environ.get('EMBEDDING_USE_JSON') == '1':
-            print(json.dumps(embedding))
-        else:
-            print(' '.join(map(str, embedding)))
+        print(json.dumps(embedding) if use_json else " ".join(map(str, embedding)))
+    return 0
 
-try:
-    main()
-except Exception as error:
-    print(f'Error: {error}', file=sys.stderr)
-    sys.exit(1)
-EOF
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as error:
+        print(f"Error: {error}", file=sys.stderr)
+        raise SystemExit(1)
