@@ -18,6 +18,17 @@ from pathlib import Path
 SOCKET_PATH = Path.home() / ".cache" / "generate_embeddings" / "daemon.sock"
 PID_PATH = SOCKET_PATH.with_suffix(".pid")
 MODEL = None
+GREEN = "\\033[32m"
+RED = "\\033[31m"
+RESET = "\\033[0m"
+ACTION = "start"
+
+
+def report(message, color=""):
+    if not sys.stderr.isatty():
+        return
+    rendered = f"{color}{message}{RESET}" if color else message
+    print(rendered, file=sys.stderr, flush=True)
 
 
 class EmbeddingHandler(socketserver.StreamRequestHandler):
@@ -94,7 +105,8 @@ def start(timeout_minutes, force):
             try:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
                     probe.connect(str(SOCKET_PATH))
-                print(f"Daemon started at {SOCKET_PATH}")
+                verb = "restarted" if force else "started"
+                report(f"✓ Daemon {verb} at {SOCKET_PATH}", GREEN)
                 return
             except OSError:
                 time.sleep(0.05)
@@ -136,6 +148,7 @@ def start(timeout_minutes, force):
 
 
 def main():
+    global ACTION
     parser = argparse.ArgumentParser(description=__doc__)
     action = parser.add_mutually_exclusive_group()
     action.add_argument("--force", action="store_true", help="stop any existing daemon and replace it")
@@ -145,8 +158,13 @@ def main():
     if args.timeout < 0:
         parser.error("--timeout must be nonnegative")
     if args.stop:
+        ACTION = "stop"
+        report("Stopping daemon...", "")
         stop_existing(force=True)
+        report("✓ Daemon stopped", GREEN)
         return
+    ACTION = "restart" if args.force else "start"
+    report("Restarting daemon..." if args.force else "Starting daemon...", "")
     start(args.timeout, args.force)
 
 
@@ -154,5 +172,8 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as error:
-        print(f"Error: {error}", file=sys.stderr)
+        if sys.stderr.isatty():
+            report(f"✗ Failed to {ACTION} daemon: {error}", RED)
+        else:
+            print(f"Error: {error}", file=sys.stderr)
         raise SystemExit(1)

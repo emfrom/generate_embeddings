@@ -1,7 +1,9 @@
 import json
 import os
+import pty
 import socket
 import socketserver
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -82,6 +84,26 @@ class DaemonCliTest(unittest.TestCase):
             text=True, capture_output=True, timeout=15,
         )
 
+    def run_daemon_in_terminal(self, *args):
+        master, slave = pty.openpty()
+        process = subprocess.Popen(
+            [str(ROOT / "generate_embeddings.daemon"), *args], env=self.env,
+            stdout=subprocess.PIPE, stderr=slave,
+        )
+        os.close(slave)
+        stdout, _ = process.communicate(timeout=15)
+        chunks = []
+        while True:
+            try:
+                chunk = os.read(master, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+        os.close(master)
+        return process.returncode, stdout.decode(), b"".join(chunks).decode()
+
     def test_cli_executes_through_uv_script_shebang(self):
         result = self.run_cli("--help")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -155,9 +177,68 @@ class DaemonCliTest(unittest.TestCase):
             server.server_close()
             thread.join()
 
+    def test_daemon_switch_defaults_to_unlimited(self):
+        isolated = self.home / "isolated"
+        isolated.mkdir()
+        cli = isolated / "generate_embeddings"
+        shutil.copy2(SCRIPT, cli)
+        daemon = isolated / "generate_embeddings.daemon"
+        daemon.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "open(os.environ['DAEMON_ARGS_FILE'], 'w').write(json.dumps(sys.argv[1:]))\n"
+        )
+        daemon.chmod(0o755)
+        env = self.env.copy()
+        env["DAEMON_ARGS_FILE"] = str(self.home / "daemon-args")
+        result = subprocess.run([str(cli), "--daemon"], env=env, text=True,
+                                capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(Path(env["DAEMON_ARGS_FILE"]).exists(), result.stderr)
+        self.assertEqual(json.loads(Path(env["DAEMON_ARGS_FILE"]).read_text()), ["--timeout", "0"])
+
+    def test_automatic_start_uses_five_minute_timeout(self):
+        isolated = self.home / "autostart"
+        isolated.mkdir()
+        cli = isolated / "generate_embeddings"
+        shutil.copy2(SCRIPT, cli)
+        daemon = isolated / "generate_embeddings.daemon"
+        daemon.write_text("""#!/usr/bin/env python3
+import json, os, socket, sys
+from pathlib import Path
+Path(os.environ['DAEMON_ARGS_FILE']).write_text(json.dumps(sys.argv[1:]))
+if os.fork():
+    sys.exit(0)
+os.setsid()
+path = Path.home() / '.cache/generate_embeddings/daemon.sock'
+path.parent.mkdir(parents=True)
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+    server.bind(str(path))
+    server.listen()
+    while True:
+        connection, _ = server.accept()
+        with connection, connection.makefile('rwb') as channel:
+            line = channel.readline()
+            if not line:
+                continue
+            channel.write(b'{\"embedding\":[1.0,2.0]}\\n')
+            break
+path.unlink()
+""")
+        daemon.chmod(0o755)
+        env = self.env.copy()
+        env["DAEMON_ARGS_FILE"] = str(self.home / "autostart-args")
+        result = subprocess.run([str(cli), "hello"], env=env, text=True,
+                                capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "1.0 2.0")
+        self.assertEqual(json.loads(Path(env["DAEMON_ARGS_FILE"]).read_text()), ["--timeout", "5"])
+
     def test_daemon_switch_launches_daemon_with_timeout(self):
         result = self.run_cli("--daemon", "10")
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Starting daemon...", result.stderr)
+        self.assertNotIn("✓", result.stderr)
         self.assertTrue(self.sock.exists())
         stopped = self.run_daemon("--stop")
         self.assertEqual(stopped.returncode, 0, stopped.stderr)
@@ -199,6 +280,42 @@ class DaemonCliTest(unittest.TestCase):
             except OSError:
                 continue
         return None
+
+    def test_cli_daemon_start_propagates_failure_status(self):
+        started = self.run_daemon("--timeout", "10")
+        self.assertEqual(started.returncode, 0, started.stderr)
+        try:
+            failed = self.run_cli("--daemon", "10")
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertIn("Error:", failed.stderr)
+        finally:
+            self.run_daemon("--stop")
+
+    def test_daemon_actions_report_progress_and_success(self):
+        code, _, start_message = self.run_daemon_in_terminal("--timeout", "10")
+        self.assertEqual(code, 0, start_message)
+        try:
+            self.assertIn("Starting daemon...", start_message)
+            self.assertIn("✓ Daemon started", start_message)
+            code, _, stop_message = self.run_daemon_in_terminal("--stop")
+            self.assertEqual(code, 0, stop_message)
+            self.assertIn("Stopping daemon...", stop_message)
+            self.assertIn("✓ Daemon stopped", stop_message)
+            self.assertFalse(self.sock.exists())
+        finally:
+            if self.sock.exists():
+                self.run_daemon("--stop")
+
+    def test_failed_duplicate_start_reports_red_cross(self):
+        first = self.run_daemon("--timeout", "10")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        try:
+            code, _, failure_message = self.run_daemon_in_terminal("--timeout", "10")
+            self.assertNotEqual(code, 0)
+            self.assertIn("Starting daemon...", failure_message)
+            self.assertIn("✗", failure_message)
+        finally:
+            self.run_daemon("--stop")
 
     def test_daemon_preloads_model_before_reporting_ready(self):
         result = self.run_daemon("--timeout", "10")
