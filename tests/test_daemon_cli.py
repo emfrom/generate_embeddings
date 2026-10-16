@@ -68,6 +68,12 @@ class DaemonCliTest(unittest.TestCase):
             capture_output=True, timeout=15,
         )
 
+    def run_daemon(self, *args):
+        return subprocess.run(
+            [str(ROOT / "generate_embeddings.daemon"), *args], env=self.env,
+            text=True, capture_output=True, timeout=15,
+        )
+
     def test_existing_daemon_receives_text_request(self):
         self.sock.parent.mkdir(parents=True)
         server = socketserver.UnixStreamServer(str(self.sock), EmbeddingHandler)
@@ -104,6 +110,24 @@ class DaemonCliTest(unittest.TestCase):
             except OSError:
                 continue
         return None
+
+    def test_force_replaces_running_daemon_and_timeout_flag_is_accepted(self):
+        first = self.run_daemon("--timeout", "10")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        first_pid = self.daemon_pid()
+        self.assertIsNotNone(first_pid)
+        try:
+            forced = self.run_daemon("--force", "--timeout", "10")
+            self.assertEqual(forced.returncode, 0, forced.stderr)
+            self.assertTrue(self.sock.exists())
+            self.assertNotEqual(self.daemon_pid(), first_pid)
+        finally:
+            pid = self.daemon_pid()
+            if pid:
+                os.kill(pid, 15)
+                deadline = time.monotonic() + 5
+                while self.sock.exists() and time.monotonic() < deadline:
+                    time.sleep(0.05)
 
     def test_missing_daemon_starts_and_handles_request(self):
         try:

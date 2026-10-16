@@ -1,44 +1,27 @@
 #!/usr/bin/env bash
 
-# This script uses 'uv run' to execute an inline Python script.
-# It generates embeddings for a single string (from argv or stdin) and returns the result.
-
 set -e
-
 VERSION="1.0.0"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-# Function to display help
 show_help() {
     cat << EOF
 Usage: ./generate_embeddings [OPTIONS] [TEXT...]
 
-Generates embeddings for a string using a pre-trained model (all-MiniLM-L6-v2).
+Generates embeddings using all-MiniLM-L6-v2. Normal invocations reuse the
+Unix-socket daemon, or start one with a 1-minute timeout if none is available.
 
 Options:
-  -             Read text from stdin instead of arguments (cannot be combined with text arguments).
-  --json       Output each embedding as a JSON array.
-  -0           With stdin mode, read NUL-terminated strings and emit one embedding per string.
-               Ignored when generating an embedding from text arguments.
-  --daemon [N] Start a Unix-socket daemon at ~/.cache/generate_embeddings/daemon.sock;
-               N is its lifetime in minutes (default: 0, unlimited).
-
-Normal invocations reuse the daemon when available, or start one with a 1-minute
-lifetime before sending the embedding request.
-  --           Treat all following arguments literally as text.
-  --help       Show this help message.
-  --version    Show version information.
-
-Examples:
-  ./generate_embeddings "hello world"
-  ./generate_embeddings --json "hello world"
-  echo "hello world" | ./generate_embeddings -
-  echo "hello world" | ./generate_embeddings --json -
-  printf 'first\\0second\\0' | ./generate_embeddings - -0
-  ./generate_embeddings --daemon 30
+  -             Read text from stdin (cannot be combined with text arguments).
+  --json        Output each embedding as a JSON array.
+  -0            With stdin, read NUL-delimited strings; ignored in text mode.
+  --daemon [N]  Launch the daemon with a timeout of N minutes (default: 0, unlimited).
+  --            Treat following arguments literally as text.
+  --help        Show this help.
+  --version     Show version.
 EOF
 }
 
-# Parse options only until --; arguments after it are always literal text.
 use_json=0
 use_stdin=0
 use_nul=0
@@ -47,43 +30,25 @@ daemon_minutes=0
 text_args=()
 while (($#)); do
     case "$1" in
-        --)
-            shift
-            text_args+=("$@")
-            break
-            ;;
-        --help)
-            show_help
-            exit 0
-            ;;
-        --version)
-            echo "$VERSION"
-            exit 0
-            ;;
-        --json)
-            use_json=1
-            ;;
-        -0)
-            use_nul=1
-            ;;
+        --) shift; text_args+=("$@"); break ;;
+        --help) show_help; exit 0 ;;
+        --version) echo "$VERSION"; exit 0 ;;
+        --json) use_json=1 ;;
+        -0) use_nul=1 ;;
         --daemon)
             daemon=1
-            if (($# > 1)) && [[ "$2" =~ ^[0-9]+$ ]]; then
-                daemon_minutes="$2"
-                shift
-            fi
+            if (($# > 1)) && [[ "$2" =~ ^[0-9]+$ ]]; then daemon_minutes="$2"; shift; fi
             ;;
-        -)
-            use_stdin=1
-            ;;
-        *)
-            text_args+=("$1")
-            ;;
+        -) use_stdin=1 ;;
+        *) text_args+=("$1") ;;
     esac
     shift
 done
 
-# The inline script uses stdin as its source, so preserve piped input separately.
+if ((daemon)); then
+    exec "$SCRIPT_DIR/generate_embeddings.daemon" --timeout "$daemon_minutes"
+fi
+
 input_file=""
 if ((use_stdin)); then
     if ((${#text_args[@]} > 0)); then
@@ -97,137 +62,28 @@ if ((use_stdin)); then
 fi
 export EMBEDDING_USE_JSON="$use_json"
 export EMBEDDING_USE_NUL="$use_nul"
-export EMBEDDING_DAEMON="$daemon"
-export EMBEDDING_DAEMON_MINUTES="$daemon_minutes"
+export EMBEDDING_DAEMON_SCRIPT="$SCRIPT_DIR/generate_embeddings.daemon"
 
-# Check if uv is installed
-if ! command -v uv &> /dev/null; then
+if ! command -v uv >/dev/null 2>&1; then
     echo "Error: 'uv' is not installed. Please install it from https://github.com/astral-sh/uv" >&2
     exit 1
 fi
 
-# Suppress library noise (warnings and progress bars)
-export PYTHONWARNINGS="ignore"
-export HF_HUB_DISABLE_PROGRESS_BARS=1
-export TRANSFORMERS_VERBOSITY="error"
-
-# Pass parsed text arguments to the Python script. Keep stderr visible for actionable errors.
 uv run --script - "${text_args[@]}" << 'EOF'
 # /// script
 # requires-python = ">=3.11"
-# dependencies = [
-#   "sentence-transformers",
-#   "numpy",
-# ]
 # ///
-
-import sys
-import os
 import json
+import os
 import socket
-import socketserver
-import signal
+import subprocess
+import sys
 import time
 from pathlib import Path
-import numpy as np
-from sentence_transformers import SentenceTransformer
 
 SOCKET_PATH = Path.home() / '.cache' / 'generate_embeddings' / 'daemon.sock'
 
-class IdleSocketServer(socketserver.UnixStreamServer):
-    allow_reuse_address = True
-
-MODEL = None
-
-class EmbeddingHandler(socketserver.StreamRequestHandler):
-    def handle(self):
-        global MODEL
-        try:
-            line = self.rfile.readline()
-            if not line:
-                return
-            request = json.loads(line)
-            if not isinstance(request.get('text'), str):
-                raise ValueError('request must contain string field "text"')
-            if MODEL is None:
-                MODEL = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')
-            embedding = MODEL.encode([request['text']], show_progress_bar=False)[0]
-            response = {'embedding': embedding.tolist() if hasattr(embedding, 'tolist') else list(embedding)}
-        except Exception as error:
-            response = {'error': str(error)}
-        self.wfile.write((json.dumps(response) + '\n').encode('utf-8'))
-
-def start_daemon():
-    SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
-    if SOCKET_PATH.exists():
-        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            probe.connect(str(SOCKET_PATH))
-        except OSError:
-            if not SOCKET_PATH.is_socket():
-                raise RuntimeError(f"Socket path exists and is not a socket: {SOCKET_PATH}")
-            SOCKET_PATH.unlink()
-        else:
-            raise RuntimeError(f"A daemon is already running at {SOCKET_PATH}")
-        finally:
-            probe.close()
-
-    pid = os.fork()
-    if pid:
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            try:
-                probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                probe.connect(str(SOCKET_PATH))
-                probe.close()
-                if os.environ.get('EMBEDDING_DAEMON_QUIET') != '1':
-                    print(f"Daemon started at {SOCKET_PATH}")
-                return
-            except OSError:
-                time.sleep(0.05)
-        raise RuntimeError("Daemon failed to start")
-
-    os.setsid()
-    server = None
-    stop_requested = False
-
-    def request_stop(signum, frame):
-        nonlocal stop_requested
-        stop_requested = True
-
-    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT):
-        signal.signal(signum, request_stop)
-    try:
-        with open(os.devnull, 'r+') as null:
-            os.dup2(null.fileno(), 0)
-            os.dup2(null.fileno(), 1)
-            os.dup2(null.fileno(), 2)
-        server = IdleSocketServer(str(SOCKET_PATH), EmbeddingHandler)
-        server.timeout = 1
-        lifetime = int(os.environ.get('EMBEDDING_DAEMON_MINUTES', '0'))
-        end_time = time.monotonic() + lifetime * 60 if lifetime else None
-        while not stop_requested and (end_time is None or time.monotonic() < end_time):
-            server.handle_request()
-    finally:
-        if server is not None:
-            server.server_close()
-        if SOCKET_PATH.exists() and SOCKET_PATH.is_socket():
-            SOCKET_PATH.unlink()
-    os._exit(0)
-
-def request_embedding(text):
-    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    client.settimeout(5)
-    client.connect(str(SOCKET_PATH))
-    with client, client.makefile('rwb') as channel:
-        channel.write((json.dumps({'text': text}) + '\n').encode('utf-8'))
-        channel.flush()
-        response = json.loads(channel.readline())
-    if 'error' in response:
-        raise RuntimeError(response['error'])
-    return response['embedding']
-
-def ensure_daemon():
+def connect_to_daemon():
     probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         probe.connect(str(SOCKET_PATH))
@@ -235,10 +91,8 @@ def ensure_daemon():
         return
     except OSError:
         probe.close()
-    os.environ['EMBEDDING_DAEMON'] = '1'
-    os.environ['EMBEDDING_DAEMON_MINUTES'] = '1'
-    os.environ['EMBEDDING_DAEMON_QUIET'] = '1'
-    start_daemon()
+    subprocess.run([os.environ['EMBEDDING_DAEMON_SCRIPT'], '--timeout', '1'],
+                   stdout=subprocess.DEVNULL, check=False)
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -249,49 +103,46 @@ def ensure_daemon():
         except OSError:
             probe.close()
             time.sleep(0.05)
-    raise RuntimeError('Daemon failed to become available')
+    raise RuntimeError('Could not start embedding daemon')
+
+def request_embedding(text):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(120)
+        client.connect(str(SOCKET_PATH))
+        with client.makefile('rwb') as channel:
+            channel.write((json.dumps({'text': text}) + '\n').encode('utf-8'))
+            channel.flush()
+            response = json.loads(channel.readline())
+    if 'error' in response:
+        raise RuntimeError(response['error'])
+    return response['embedding']
 
 def main():
-    if os.environ.get('EMBEDDING_DAEMON') == '1':
-        start_daemon()
-        return
-
-    # The script name is '-' when run via 'uv run --script -'
-    # We filter out the flags we've handled or will handle in Python
-    text_args = sys.argv[1:]
-    use_json = os.environ.get('EMBEDDING_USE_JSON') == '1'
+    texts_args = sys.argv[1:]
     input_file = os.environ.get('EMBEDDING_INPUT_FILE')
-
-    use_nul = os.environ.get('EMBEDDING_USE_NUL') == '1'
     if input_file:
-        with open(input_file, 'rb') as source:
-            raw_input = source.read()
-        if use_nul:
-            texts = raw_input.decode('utf-8').split('\0')
-            if raw_input.endswith(b'\0'):
+        raw = Path(input_file).read_bytes()
+        if os.environ.get('EMBEDDING_USE_NUL') == '1':
+            texts = raw.decode('utf-8').split('\0')
+            if raw.endswith(b'\0'):
                 texts.pop()
         else:
-            texts = [raw_input.decode('utf-8').strip()]
+            texts = [raw.decode('utf-8').strip()]
     else:
-        texts = [" ".join(text_args)]
-
+        texts = [' '.join(texts_args)]
     if not texts or (len(texts) == 1 and not texts[0]):
-        sys.exit(0)
+        return
+    connect_to_daemon()
+    for text in texts:
+        embedding = request_embedding(text)
+        if os.environ.get('EMBEDDING_USE_JSON') == '1':
+            print(json.dumps(embedding))
+        else:
+            print(' '.join(map(str, embedding)))
 
-    try:
-        ensure_daemon()
-        for text in texts:
-            embedding = request_embedding(text)
-            if use_json:
-                print(json.dumps(embedding))
-            else:
-                print(" ".join(map(str, embedding)))
-            
-    except Exception as e:
-        # Report actionable failures on stderr.
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
-
-if __name__ == "__main__":
+try:
     main()
+except Exception as error:
+    print(f'Error: {error}', file=sys.stderr)
+    sys.exit(1)
 EOF

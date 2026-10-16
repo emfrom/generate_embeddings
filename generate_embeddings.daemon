@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+
+set -e
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+force=0
+timeout_minutes=0
+while (($#)); do
+    case "$1" in
+        --force) force=1 ;;
+        --timeout)
+            (($# >= 2)) || { echo "Error: --timeout requires minutes" >&2; exit 2; }
+            [[ "$2" =~ ^[0-9]+$ ]] || { echo "Error: timeout must be a nonnegative integer" >&2; exit 2; }
+            timeout_minutes="$2"
+            shift
+            ;;
+        --help)
+            echo "Usage: ./generate_embeddings.daemon [--force] [--timeout N]"
+            echo "--force stops any running daemon and replaces it; timeout is minutes (0 = unlimited)."
+            exit 0
+            ;;
+        *) echo "Error: unknown option: $1" >&2; exit 2 ;;
+    esac
+    shift
+done
+if ! command -v uv >/dev/null 2>&1; then
+    echo "Error: 'uv' is not installed. Please install it from https://github.com/astral-sh/uv" >&2
+    exit 1
+fi
+export EMBEDDING_DAEMON_FORCE="$force"
+export EMBEDDING_DAEMON_TIMEOUT="$timeout_minutes"
+uv run --script - << 'EOF'
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["sentence-transformers", "numpy"]
+# ///
+import json
+import os
+import signal
+import socket
+import socketserver
+import sys
+import time
+from pathlib import Path
+from sentence_transformers import SentenceTransformer
+
+SOCKET_PATH = Path.home() / '.cache' / 'generate_embeddings' / 'daemon.sock'
+PID_PATH = SOCKET_PATH.with_suffix('.pid')
+MODEL = None
+
+class EmbeddingHandler(socketserver.StreamRequestHandler):
+    def handle(self):
+        global MODEL
+        line = self.rfile.readline()
+        if not line:
+            return
+        try:
+            request = json.loads(line)
+            if not isinstance(request.get('text'), str):
+                raise ValueError('request must contain string field "text"')
+            if MODEL is None:
+                MODEL = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')
+            embedding = MODEL.encode([request['text']], show_progress_bar=False)[0]
+            response = {'embedding': embedding.tolist() if hasattr(embedding, 'tolist') else list(embedding)}
+        except Exception as error:
+            response = {'error': str(error)}
+        try:
+            self.wfile.write((json.dumps(response) + '\n').encode('utf-8'))
+        except OSError:
+            pass
+
+class UnixServer(socketserver.UnixStreamServer):
+    allow_reuse_address = True
+
+def stop_existing(force):
+    pid = None
+    try:
+        pid = int(PID_PATH.read_text().strip())
+    except (FileNotFoundError, ValueError):
+        pass
+    if pid:
+        try:
+            os.kill(pid, 0)
+            alive = True
+        except ProcessLookupError:
+            alive = False
+        except PermissionError:
+            raise RuntimeError(f'Cannot inspect daemon process {pid}')
+        if alive and not force:
+            raise RuntimeError(f'Daemon already running (PID {pid}) at {SOCKET_PATH}')
+        if alive:
+            os.kill(pid, signal.SIGTERM)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.05)
+            else:
+                os.kill(pid, signal.SIGKILL)
+                time.sleep(0.1)
+    if PID_PATH.exists():
+        PID_PATH.unlink()
+    if SOCKET_PATH.exists():
+        if not SOCKET_PATH.is_socket():
+            raise RuntimeError(f'Socket path exists and is not a socket: {SOCKET_PATH}')
+        SOCKET_PATH.unlink()
+
+def start():
+    SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
+    stop_existing(os.environ.get('EMBEDDING_DAEMON_FORCE') == '1')
+    pid = os.fork()
+    if pid:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                probe.connect(str(SOCKET_PATH))
+                probe.close()
+                print(f'Daemon started at {SOCKET_PATH}')
+                return
+            except OSError:
+                time.sleep(0.05)
+        raise RuntimeError('Daemon failed to start')
+
+    os.setsid()
+    server = None
+    stopping = False
+    def request_stop(signum, frame):
+        nonlocal stopping
+        stopping = True
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT):
+        signal.signal(sig, request_stop)
+    try:
+        with open(os.devnull, 'r+') as null:
+            for fd in (0, 1, 2):
+                os.dup2(null.fileno(), fd)
+        server = UnixServer(str(SOCKET_PATH), EmbeddingHandler)
+        server.timeout = 1
+        PID_PATH.write_text(str(os.getpid()))
+        timeout = int(os.environ.get('EMBEDDING_DAEMON_TIMEOUT', '0'))
+        end = time.monotonic() + timeout * 60 if timeout else None
+        while not stopping and (end is None or time.monotonic() < end):
+            server.handle_request()
+    finally:
+        if server is not None:
+            server.server_close()
+        try:
+            if PID_PATH.read_text().strip() == str(os.getpid()):
+                PID_PATH.unlink()
+                if SOCKET_PATH.exists() and SOCKET_PATH.is_socket():
+                    SOCKET_PATH.unlink()
+        except FileNotFoundError:
+            pass
+    os._exit(0)
+
+try:
+    start()
+except Exception as error:
+    print(f'Error: {error}', file=sys.stderr)
+    sys.exit(1)
+EOF
