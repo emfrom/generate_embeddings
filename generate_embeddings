@@ -15,8 +15,9 @@ Usage: ./generate_embeddings [OPTIONS] [TEXT...]
 Generates embeddings for a string using a pre-trained model (all-MiniLM-L6-v2).
 
 Options:
-  -             Read text from stdin instead of arguments.
+  -             Read text from stdin instead of arguments (takes precedence over text arguments).
   --json       Output the embedding as a JSON array.
+  --           Treat all following arguments literally as text.
   --help       Show this help message.
   --version    Show version information.
 
@@ -28,16 +29,47 @@ Examples:
 EOF
 }
 
-# Check for --help or --version before launching uv
-for arg in "$@"; do
-    if [[ "$arg" == "--help" ]]; then
-        show_help
-        exit 0
-    elif [[ "$arg" == "--version" ]]; then
-        echo "$VERSION"
-        exit 0
-    fi
+# Parse options only until --; arguments after it are always literal text.
+use_json=0
+use_stdin=0
+text_args=()
+while (($#)); do
+    case "$1" in
+        --)
+            shift
+            text_args+=("$@")
+            break
+            ;;
+        --help)
+            show_help
+            exit 0
+            ;;
+        --version)
+            echo "$VERSION"
+            exit 0
+            ;;
+        --json)
+            use_json=1
+            ;;
+        -)
+            use_stdin=1
+            ;;
+        *)
+            text_args+=("$1")
+            ;;
+    esac
+    shift
 done
+
+# The inline script uses stdin as its source, so preserve piped input separately.
+input_file=""
+if ((use_stdin)); then
+    input_file=$(mktemp)
+    trap 'rm -f "$input_file"' EXIT
+    cat > "$input_file"
+    export EMBEDDING_INPUT_FILE="$input_file"
+fi
+export EMBEDDING_USE_JSON="$use_json"
 
 # Check if uv is installed
 if ! command -v uv &> /dev/null; then
@@ -50,10 +82,8 @@ export PYTHONWARNINGS="ignore"
 export HF_HUB_DISABLE_PROGRESS_BARS=1
 export TRANSFORMERS_VERBOSITY="error"
 
-# Pass all arguments to the python script
-# We redirect stderr to /dev/null to suppress the "Loading weights" and "HF Hub" warnings.
-# Note: This also suppresses actual Python errors. If you need to see errors, run with 2>&1.
-uv run --script - "$@" 2>/dev/null << 'EOF'
+# Pass parsed text arguments to the Python script. Keep stderr visible for actionable errors.
+uv run --script - "${text_args[@]}" << 'EOF'
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
@@ -63,6 +93,7 @@ uv run --script - "$@" 2>/dev/null << 'EOF'
 # ///
 
 import sys
+import os
 import json
 import numpy as np
 from sentence_transformers import SentenceTransformer
@@ -70,17 +101,13 @@ from sentence_transformers import SentenceTransformer
 def main():
     # The script name is '-' when run via 'uv run --script -'
     # We filter out the flags we've handled or will handle in Python
-    raw_args = sys.argv[1:]
-    
-    use_json = '--json' in raw_args
-    use_stdin = '-' in raw_args
-    
-    # Filter out the control flags to get the actual text arguments
-    # We exclude '--json' and '-'
-    text_args = [a for a in raw_args if a not in ('--json', '-')]
+    text_args = sys.argv[1:]
+    use_json = os.environ.get('EMBEDDING_USE_JSON') == '1'
+    input_file = os.environ.get('EMBEDDING_INPUT_FILE')
 
-    if use_stdin:
-        text = sys.stdin.read().strip()
+    if input_file:
+        with open(input_file, encoding='utf-8') as source:
+            text = source.read().strip()
     else:
         text = " ".join(text_args)
 
@@ -102,9 +129,7 @@ def main():
             print(" ".join(map(str, embedding)))
             
     except Exception as e:
-        # Since we redirected stderr to /dev/null in the bash wrapper,
-        # we'll print the error to stderr, but it will be swallowed.
-        # This is intentional to keep the output clean for pipelines.
+        # Report actionable failures on stderr.
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
