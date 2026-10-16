@@ -16,7 +16,9 @@ Generates embeddings for a string using a pre-trained model (all-MiniLM-L6-v2).
 
 Options:
   -             Read text from stdin instead of arguments (cannot be combined with text arguments).
-  --json       Output the embedding as a JSON array.
+  --json       Output each embedding as a JSON array.
+  -0           With stdin mode, read NUL-terminated strings and emit one embedding per string.
+               Ignored when generating an embedding from text arguments.
   --           Treat all following arguments literally as text.
   --help       Show this help message.
   --version    Show version information.
@@ -26,12 +28,14 @@ Examples:
   ./generate_embeddings --json "hello world"
   echo "hello world" | ./generate_embeddings -
   echo "hello world" | ./generate_embeddings --json -
+  printf 'first\\0second\\0' | ./generate_embeddings - -0
 EOF
 }
 
 # Parse options only until --; arguments after it are always literal text.
 use_json=0
 use_stdin=0
+use_nul=0
 text_args=()
 while (($#)); do
     case "$1" in
@@ -50,6 +54,9 @@ while (($#)); do
             ;;
         --json)
             use_json=1
+            ;;
+        -0)
+            use_nul=1
             ;;
         -)
             use_stdin=1
@@ -74,6 +81,7 @@ if ((use_stdin)); then
     export EMBEDDING_INPUT_FILE="$input_file"
 fi
 export EMBEDDING_USE_JSON="$use_json"
+export EMBEDDING_USE_NUL="$use_nul"
 
 # Check if uv is installed
 if ! command -v uv &> /dev/null; then
@@ -109,28 +117,34 @@ def main():
     use_json = os.environ.get('EMBEDDING_USE_JSON') == '1'
     input_file = os.environ.get('EMBEDDING_INPUT_FILE')
 
+    use_nul = os.environ.get('EMBEDDING_USE_NUL') == '1'
     if input_file:
-        with open(input_file, encoding='utf-8') as source:
-            text = source.read().strip()
+        with open(input_file, 'rb') as source:
+            raw_input = source.read()
+        if use_nul:
+            texts = raw_input.decode('utf-8').split('\0')
+            if raw_input.endswith(b'\0'):
+                texts.pop()
+        else:
+            texts = [raw_input.decode('utf-8').strip()]
     else:
-        text = " ".join(text_args)
+        texts = [" ".join(text_args)]
 
-    if not text:
+    if not texts or (len(texts) == 1 and not texts[0]):
         sys.exit(0)
 
     try:
         # Load model on CPU
         model = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')
         
-        # Compute embedding, suppressing progress bar
-        embedding = model.encode([text], show_progress_bar=False)[0]
+        # Compute embeddings, suppressing progress bar
+        embeddings = model.encode(texts, show_progress_bar=False)
         
-        if use_json:
-            # Output as JSON array
-            print(json.dumps(embedding.tolist()))
-        else:
-            # Output as space-separated values (plain text)
-            print(" ".join(map(str, embedding)))
+        for embedding in embeddings:
+            if use_json:
+                print(json.dumps(embedding.tolist()))
+            else:
+                print(" ".join(map(str, embedding)))
             
     except Exception as e:
         # Report actionable failures on stderr.
