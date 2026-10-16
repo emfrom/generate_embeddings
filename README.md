@@ -11,8 +11,9 @@ echo "hello world" | ./generate_embeddings -
 ```
 
 A Unix-socket daemon is started automatically when needed. Manage it explicitly
-with `./generate_embeddings --daemon [MINUTES]`; use
-`./generate_embeddings.daemon --stop` to stop it. `--daemon` without a timeout
-runs until stopped.
+with `./generate_embeddings --daemon [MINUTES]`; this explicit launch runs
+until stopped if no timeout is given. Automatic startup uses a 5-minute timeout.
+Use `./generate_embeddings.daemon --stop` to stop it. Directly launching
+`generate_embeddings.daemon` without a timeout also runs until stopped.
 
 Licensed under the MIT License; see [LICENSE](LICENSE).
