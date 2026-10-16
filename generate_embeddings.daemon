@@ -31,8 +31,7 @@ class EmbeddingHandler(socketserver.StreamRequestHandler):
             if not isinstance(request.get("text"), str):
                 raise ValueError('request must contain string field "text"')
             if MODEL is None:
-                from sentence_transformers import SentenceTransformer
-                MODEL = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
+                raise RuntimeError("Embedding model is not loaded")
             embedding = MODEL.encode([request["text"]], show_progress_bar=False)[0]
             values = embedding.tolist() if hasattr(embedding, "tolist") else list(embedding)
             response = {"embedding": values}
@@ -85,11 +84,12 @@ def stop_existing(force):
 
 
 def start(timeout_minutes, force):
+    global MODEL
     SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
     stop_existing(force)
     pid = os.fork()
     if pid:
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 300
         while time.monotonic() < deadline:
             try:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
@@ -114,6 +114,8 @@ def start(timeout_minutes, force):
         with open(os.devnull, "r+") as null:
             for fd in (0, 1, 2):
                 os.dup2(null.fileno(), fd)
+        from sentence_transformers import SentenceTransformer
+        MODEL = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
         server = UnixServer(str(SOCKET_PATH), EmbeddingHandler)
         server.timeout = 1
         PID_PATH.write_text(str(os.getpid()))

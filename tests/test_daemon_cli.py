@@ -34,8 +34,10 @@ class DaemonCliTest(unittest.TestCase):
         self.pythonpath = self.home / "python"
         self.pythonpath.mkdir()
         (self.pythonpath / "sentence_transformers.py").write_text(
+            "import os\n"
             "class SentenceTransformer:\n"
-            "    def __init__(self, *args, **kwargs): pass\n"
+            "    def __init__(self, *args, **kwargs):\n"
+            "        with open(os.environ['MODEL_INIT_MARKER'], 'a') as marker: marker.write('loaded\\n')\n"
             "    def encode(self, texts, **kwargs): return [[1.0, 2.0] for _ in texts]\n"
         )
         (self.pythonpath / "numpy.py").write_text("")
@@ -61,6 +63,7 @@ class DaemonCliTest(unittest.TestCase):
             PATH=f"{self.bin}:{os.environ['PATH']}",
             PYTHONPATH=str(self.pythonpath),
             UV_SEEN=str(self.home / "uv-seen"),
+            MODEL_INIT_MARKER=str(self.home / "model-init"),
         )
         self.sock = self.home / ".cache/generate_embeddings/daemon.sock"
 
@@ -196,6 +199,15 @@ class DaemonCliTest(unittest.TestCase):
             except OSError:
                 continue
         return None
+
+    def test_daemon_preloads_model_before_reporting_ready(self):
+        result = self.run_daemon("--timeout", "10")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        try:
+            self.assertTrue(Path(self.env["MODEL_INIT_MARKER"]).exists())
+            self.assertEqual(Path(self.env["MODEL_INIT_MARKER"]).read_text(), "loaded\n")
+        finally:
+            self.run_daemon("--stop")
 
     def test_force_replaces_running_daemon_and_timeout_flag_is_accepted(self):
         first = self.run_daemon("--timeout", "10")
