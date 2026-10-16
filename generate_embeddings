@@ -15,7 +15,7 @@ Usage: ./generate_embeddings [OPTIONS] [TEXT...]
 Generates embeddings for a string using a pre-trained model (all-MiniLM-L6-v2).
 
 Options:
-  -             Read text from stdin instead of arguments (takes precedence over text arguments).
+  -             Read text from stdin instead of arguments (cannot be combined with text arguments).
   --json       Output the embedding as a JSON array.
   --           Treat all following arguments literally as text.
   --help       Show this help message.
@@ -64,6 +64,10 @@ done
 # The inline script uses stdin as its source, so preserve piped input separately.
 input_file=""
 if ((use_stdin)); then
+    if ((${#text_args[@]} > 0)); then
+        echo "Error: '-' cannot be combined with text arguments; use '--' to pass a literal '-'." >&2
+        exit 2
+    fi
     input_file=$(mktemp)
     trap 'rm -f "$input_file"' EXIT
     cat > "$input_file"
