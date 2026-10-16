@@ -67,9 +67,9 @@ class DaemonCliTest(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def run_cli(self, *args):
+    def run_cli(self, *args, input=None):
         return subprocess.run(
-            [str(SCRIPT), *args], env=self.env, text=True,
+            [str(SCRIPT), *args], env=self.env, text=True, input=input,
             capture_output=True, timeout=15,
         )
 
@@ -83,6 +83,82 @@ class DaemonCliTest(unittest.TestCase):
         result = self.run_cli("--help")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(str(SCRIPT), Path(self.env["UV_SEEN"]).read_text())
+
+    def test_version_switch_prints_version(self):
+        result = self.run_cli("--version")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "1.0.0")
+
+    def test_json_switch_formats_embedding_as_json(self):
+        self.sock.parent.mkdir(parents=True)
+        server = socketserver.UnixStreamServer(str(self.sock), EmbeddingHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        EmbeddingHandler.requests.clear()
+        try:
+            result = self.run_cli("--json", "hello")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), [1.0, 2.0])
+            self.assertEqual(EmbeddingHandler.requests, [{"text": "hello"}])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_stdin_switch_sends_stdin_text(self):
+        self.sock.parent.mkdir(parents=True)
+        server = socketserver.UnixStreamServer(str(self.sock), EmbeddingHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        EmbeddingHandler.requests.clear()
+        try:
+            result = self.run_cli("-", input="hello")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(EmbeddingHandler.requests, [{"text": "hello"}])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_nul_switch_embeds_each_stdin_record(self):
+        self.sock.parent.mkdir(parents=True)
+        server = socketserver.UnixStreamServer(str(self.sock), EmbeddingHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        EmbeddingHandler.requests.clear()
+        try:
+            result = self.run_cli("-", "-0", input="first" + chr(0) + "second" + chr(0))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(len(result.stdout.splitlines()), 2)
+            self.assertEqual(EmbeddingHandler.requests, [{"text": "first"}, {"text": "second"}])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_double_dash_treats_control_tokens_as_text(self):
+        self.sock.parent.mkdir(parents=True)
+        server = socketserver.UnixStreamServer(str(self.sock), EmbeddingHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        EmbeddingHandler.requests.clear()
+        try:
+            result = self.run_cli("--", "--json", "-")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "1.0 2.0")
+            self.assertEqual(EmbeddingHandler.requests, [{"text": "--json -"}])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_daemon_switch_launches_daemon_with_timeout(self):
+        result = self.run_cli("--daemon", "10")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.sock.exists())
+        stopped = self.run_daemon("--stop")
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        self.assertFalse(self.sock.exists())
 
     def test_existing_daemon_receives_text_request(self):
         self.sock.parent.mkdir(parents=True)
