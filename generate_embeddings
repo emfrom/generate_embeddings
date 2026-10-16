@@ -10,7 +10,7 @@ VERSION="1.0.0"
 # Function to display help
 show_help() {
     cat << EOF
-Usage: ./generate_embeddings.sh [OPTIONS] [TEXT...]
+Usage: ./generate_embeddings [OPTIONS] [TEXT...]
 
 Generates embeddings for a string using a pre-trained model (all-MiniLM-L6-v2).
 
@@ -21,10 +21,10 @@ Options:
   --version    Show version information.
 
 Examples:
-  ./generate_embeddings.sh "hello world"
-  ./generate_embeddings.sh --json "hello world"
-  echo "hello world" | ./generate_embeddings.sh -
-  echo "hello world" | ./generate_embeddings.sh - --json
+  ./generate_embeddings "hello world"
+  ./generate_embeddings --json "hello world"
+  echo "hello world" | ./generate_embeddings -
+  echo "hello world" | ./generate_embeddings --json -
 EOF
 }
 
