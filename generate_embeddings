@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+
+# This script uses 'uv run' to execute an inline Python script.
+# It generates embeddings for a single string (from argv or stdin) and returns the result.
+
+set -e
+
+VERSION="1.0.0"
+
+# Function to display help
+show_help() {
+    cat << EOF
+Usage: ./generate_embeddings.sh [OPTIONS] [TEXT...]
+
+Generates embeddings for a string using a pre-trained model (all-MiniLM-L6-v2).
+
+Options:
+  -             Read text from stdin instead of arguments.
+  --json       Output the embedding as a JSON array.
+  --help       Show this help message.
+  --version    Show version information.
+
+Examples:
+  ./generate_embeddings.sh "hello world"
+  ./generate_embeddings.sh --json "hello world"
+  echo "hello world" | ./generate_embeddings.sh -
+  echo "hello world" | ./generate_embeddings.sh - --json
+EOF
+}
+
+# Check for --help or --version before launching uv
+for arg in "$@"; do
+    if [[ "$arg" == "--help" ]]; then
+        show_help
+        exit 0
+    elif [[ "$arg" == "--version" ]]; then
+        echo "$VERSION"
+        exit 0
+    fi
+done
+
+# Check if uv is installed
+if ! command -v uv &> /dev/null; then
+    echo "Error: 'uv' is not installed. Please install it from https://github.com/astral-sh/uv" >&2
+    exit 1
+fi
+
+# Suppress library noise (warnings and progress bars)
+export PYTHONWARNINGS="ignore"
+export HF_HUB_DISABLE_PROGRESS_BARS=1
+export TRANSFORMERS_VERBOSITY="error"
+
+# Pass all arguments to the python script
+# We redirect stderr to /dev/null to suppress the "Loading weights" and "HF Hub" warnings.
+# Note: This also suppresses actual Python errors. If you need to see errors, run with 2>&1.
+uv run --script - "$@" 2>/dev/null << 'EOF'
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "sentence-transformers",
+#   "numpy",
+# ]
+# ///
+
+import sys
+import json
+import numpy as np
+from sentence_transformers import SentenceTransformer
+
+def main():
+    # The script name is '-' when run via 'uv run --script -'
+    # We filter out the flags we've handled or will handle in Python
+    raw_args = sys.argv[1:]
+    
+    use_json = '--json' in raw_args
+    use_stdin = '-' in raw_args
+    
+    # Filter out the control flags to get the actual text arguments
+    # We exclude '--json' and '-'
+    text_args = [a for a in raw_args if a not in ('--json', '-')]
+
+    if use_stdin:
+        text = sys.stdin.read().strip()
+    else:
+        text = " ".join(text_args)
+
+    if not text:
+        sys.exit(0)
+
+    try:
+        # Load model on CPU
+        model = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')
+        
+        # Compute embedding, suppressing progress bar
+        embedding = model.encode([text], show_progress_bar=False)[0]
+        
+        if use_json:
+            # Output as JSON array
+            print(json.dumps(embedding.tolist()))
+        else:
+            # Output as space-separated values (plain text)
+            print(" ".join(map(str, embedding)))
+            
+    except Exception as e:
+        # Since we redirected stderr to /dev/null in the bash wrapper,
+        # we'll print the error to stderr, but it will be swallowed.
+        # This is intentional to keep the output clean for pipelines.
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+EOF
