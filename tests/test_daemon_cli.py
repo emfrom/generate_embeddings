@@ -4,6 +4,7 @@ import pty
 import socket
 import socketserver
 import shutil
+import select
 import subprocess
 import tempfile
 import threading
@@ -172,14 +173,42 @@ class DaemonCliTest(unittest.TestCase):
         thread.start()
         EmbeddingHandler.requests.clear()
         try:
-            items = [f"item-{i}" for i in range(10001)]
+            items = [f"item-{i}" for i in range(129)]
             result = self.run_cli("--json", "-", "-0", input="\0".join(items) + "\0")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(len(result.stdout.splitlines()), len(items))
-            self.assertEqual(len(EmbeddingHandler.requests), 2)
-            self.assertEqual(len(EmbeddingHandler.requests[0]["texts"]), 10000)
-            self.assertEqual(EmbeddingHandler.requests[1], {"text": items[-1]})
+            self.assertEqual(len(EmbeddingHandler.requests), 3)
+            self.assertEqual(len(EmbeddingHandler.requests[0]["texts"]), 64)
+            self.assertEqual(len(EmbeddingHandler.requests[1]["texts"]), 64)
+            self.assertEqual(EmbeddingHandler.requests[2], {"text": items[-1]})
         finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_nul_stdin_flushes_batch_before_end_of_input(self):
+        self.sock.parent.mkdir(parents=True)
+        server = socketserver.UnixStreamServer(str(self.sock), EmbeddingHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        process = subprocess.Popen(
+            [str(SCRIPT), "--json", "-", "-0"], env=self.env,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        try:
+            process.stdin.write("\0".join(f"item-{i}" for i in range(64)).encode() + b"\0")
+            process.stdin.flush()
+            ready, _, _ = select.select([process.stdout], [], [], 10)
+            self.assertTrue(ready, "first batch should be emitted while stdin remains open")
+            self.assertEqual(json.loads(process.stdout.readline()), [0.0, 2.0])
+            process.stdin.close()
+            self.assertEqual(process.wait(timeout=10), 0, process.stderr.read().decode())
+            process.stdout.close()
+            process.stderr.close()
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
             server.shutdown()
             server.server_close()
             thread.join()

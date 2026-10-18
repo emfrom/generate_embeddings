@@ -43,8 +43,8 @@ class EmbeddingHandler(socketserver.StreamRequestHandler):
             texts = [request.get("text")] if scalar else request.get("texts")
             if not isinstance(texts, list) or not texts or any(not isinstance(text, str) for text in texts):
                 raise ValueError('request must contain a string "text" or nonempty string array "texts"')
-            if len(texts) > 10_000:
-                raise ValueError("batch exceeds maximum of 10000 texts")
+            if len(texts) > 64:
+                raise ValueError("batch exceeds maximum of 64 texts")
             if MODEL is None:
                 raise RuntimeError("Embedding model is not loaded")
             vectors = MODEL.encode(texts, batch_size=64, show_progress_bar=False)

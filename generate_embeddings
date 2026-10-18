@@ -6,14 +6,16 @@
 
 import json
 import os
+import queue
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 SOCKET_PATH = Path.home() / ".cache" / "generate_embeddings" / "daemon.sock"
-REQUEST_BATCH_SIZE = 10_000
+REQUEST_BATCH_SIZE = 64
 DAEMON_SCRIPT = Path(__file__).with_name("generate_embeddings.daemon")
 
 HELP = """Usage: ./generate_embeddings [OPTIONS] [TEXT...]
@@ -24,7 +26,7 @@ Unix-socket daemon, or start one with a 1-minute timeout if none is available.
 Options:
   -             Read text from stdin (cannot be combined with text arguments).
   --json        Output each embedding as a JSON array.
-  -0            With stdin, read NUL-delimited strings in batches of up to 10,000; ignored in text mode.
+  -0            With stdin, stream NUL-delimited strings in batches of 64; ignored in text mode.
   --daemon [N]  Launch the daemon for N minutes (default: 0, unlimited).
   --            Treat following arguments literally as text.
   --help        Show this help.
@@ -107,12 +109,69 @@ def request_embeddings(texts):
     return embeddings
 
 
+def iter_nul_batches(stream):
+    batch = []
+    remainder = b""
+    while True:
+        raw = stream.read1(64 * 1024)
+        if not raw:
+            break
+        offset = 0
+        data = remainder + raw
+        while True:
+            separator = data.find(b"\0", offset)
+            if separator < 0:
+                remainder = data[offset:]
+                break
+            batch.append(data[offset:separator].decode("utf-8"))
+            offset = separator + 1
+            if len(batch) == REQUEST_BATCH_SIZE:
+                yield batch
+                batch = []
+    if remainder:
+        batch.append(remainder.decode("utf-8"))
+    if batch:
+        yield batch
+
+
 def emit_batch(texts, use_json):
     embeddings = request_embeddings(texts)
     if len(embeddings) != len(texts):
         raise RuntimeError("Daemon returned an invalid batch response")
     for embedding in embeddings:
         print(json.dumps(embedding) if use_json else " ".join(map(str, embedding)), flush=True)
+
+
+def stream_nul_input(use_json):
+    batches = queue.Queue(maxsize=1)
+    prefetch_slot = threading.Semaphore(1)
+    finished = object()
+
+    def read_ahead():
+        iterator = iter_nul_batches(sys.stdin.buffer)
+        while True:
+            prefetch_slot.acquire()
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                prefetch_slot.release()
+                batches.put(finished)
+                return
+            except Exception as error:
+                prefetch_slot.release()
+                batches.put(error)
+                return
+            batches.put(batch)
+
+    threading.Thread(target=read_ahead, daemon=True).start()
+    while True:
+        batch = batches.get()
+        if batch is finished:
+            return
+        if isinstance(batch, Exception):
+            raise batch
+        prefetch_slot.release()
+        emit_batch(batch, use_json)
 
 
 def main():
@@ -125,20 +184,7 @@ def main():
         return 2
     if use_stdin and use_nul:
         connect_to_daemon()
-        batch = []
-        remainder = b""
-        for raw in iter(lambda: sys.stdin.buffer.read(64 * 1024), b""):
-            pieces = (remainder + raw).split(b"\0")
-            remainder = pieces.pop()
-            for piece in pieces:
-                batch.append(piece.decode("utf-8"))
-                if len(batch) == REQUEST_BATCH_SIZE:
-                    emit_batch(batch, use_json)
-                    batch = []
-        if remainder:
-            batch.append(remainder.decode("utf-8"))
-        if batch:
-            emit_batch(batch, use_json)
+        stream_nul_input(use_json)
         return 0
     if use_stdin:
         texts = [sys.stdin.buffer.read().decode("utf-8").strip()]
