@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 
 SOCKET_PATH = Path.home() / ".cache" / "generate_embeddings" / "daemon.sock"
+REQUEST_BATCH_SIZE = 10_000
 DAEMON_SCRIPT = Path(__file__).with_name("generate_embeddings.daemon")
 
 HELP = """Usage: ./generate_embeddings [OPTIONS] [TEXT...]
@@ -23,7 +24,7 @@ Unix-socket daemon, or start one with a 1-minute timeout if none is available.
 Options:
   -             Read text from stdin (cannot be combined with text arguments).
   --json        Output each embedding as a JSON array.
-  -0            With stdin, read NUL-delimited strings; ignored in text mode.
+  -0            With stdin, read NUL-delimited strings in batches of up to 10,000; ignored in text mode.
   --daemon [N]  Launch the daemon for N minutes (default: 0, unlimited).
   --            Treat following arguments literally as text.
   --help        Show this help.
@@ -87,17 +88,31 @@ def connect_to_daemon():
     raise RuntimeError("Could not start embedding daemon")
 
 
-def request_embedding(text):
+def request_embeddings(texts):
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.settimeout(120)
         client.connect(str(SOCKET_PATH))
         with client.makefile("rwb") as channel:
-            channel.write((json.dumps({"text": text}) + "\n").encode("utf-8"))
+            request = {"text": texts[0]} if len(texts) == 1 else {"texts": texts}
+            channel.write((json.dumps(request) + "\n").encode("utf-8"))
             channel.flush()
             response = json.loads(channel.readline())
     if "error" in response:
         raise RuntimeError(response["error"])
-    return response["embedding"]
+    if len(texts) == 1 and "embedding" in response:
+        return [response["embedding"]]
+    embeddings = response.get("embeddings")
+    if not isinstance(embeddings, list) or len(embeddings) != len(texts):
+        raise RuntimeError("Daemon returned an invalid batch response")
+    return embeddings
+
+
+def emit_batch(texts, use_json):
+    embeddings = request_embeddings(texts)
+    if len(embeddings) != len(texts):
+        raise RuntimeError("Daemon returned an invalid batch response")
+    for embedding in embeddings:
+        print(json.dumps(embedding) if use_json else " ".join(map(str, embedding)), flush=True)
 
 
 def main():
@@ -108,22 +123,31 @@ def main():
     if use_stdin and text_args:
         print("Error: '-' cannot be combined with text arguments; use '--' to pass a literal '-'.", file=sys.stderr)
         return 2
+    if use_stdin and use_nul:
+        connect_to_daemon()
+        batch = []
+        remainder = b""
+        for raw in iter(lambda: sys.stdin.buffer.read(64 * 1024), b""):
+            pieces = (remainder + raw).split(b"\0")
+            remainder = pieces.pop()
+            for piece in pieces:
+                batch.append(piece.decode("utf-8"))
+                if len(batch) == REQUEST_BATCH_SIZE:
+                    emit_batch(batch, use_json)
+                    batch = []
+        if remainder:
+            batch.append(remainder.decode("utf-8"))
+        if batch:
+            emit_batch(batch, use_json)
+        return 0
     if use_stdin:
-        raw = sys.stdin.buffer.read()
-        if use_nul:
-            texts = raw.decode("utf-8").split("\0")
-            if raw.endswith(b"\0"):
-                texts.pop()
-        else:
-            texts = [raw.decode("utf-8").strip()]
+        texts = [sys.stdin.buffer.read().decode("utf-8").strip()]
     else:
         texts = [" ".join(text_args)]
-    if not texts or (len(texts) == 1 and not texts[0]):
+    if not texts[0]:
         return 0
     connect_to_daemon()
-    for text in texts:
-        embedding = request_embedding(text)
-        print(json.dumps(embedding) if use_json else " ".join(map(str, embedding)))
+    emit_batch(texts, use_json)
     return 0
 
 

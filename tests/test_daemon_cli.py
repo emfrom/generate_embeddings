@@ -24,7 +24,11 @@ class EmbeddingHandler(socketserver.StreamRequestHandler):
             return
         request = json.loads(line)
         self.requests.append(request)
-        self.wfile.write(b'{"embedding":[1.0,2.0]}\n')
+        if "texts" in request:
+            response = {"embeddings": [[float(i), 2.0] for i, _ in enumerate(request["texts"])]}
+        else:
+            response = {"embedding": [1.0, 2.0]}
+        self.wfile.write((json.dumps(response) + "\n").encode())
 
 
 class DaemonCliTest(unittest.TestCase):
@@ -152,10 +156,45 @@ class DaemonCliTest(unittest.TestCase):
         thread.start()
         EmbeddingHandler.requests.clear()
         try:
-            result = self.run_cli("-", "-0", input="first" + chr(0) + "second" + chr(0))
+            result = self.run_cli("--json", "-", "-0", input="first" + chr(0) + "second" + chr(0))
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(len(result.stdout.splitlines()), 2)
-            self.assertEqual(EmbeddingHandler.requests, [{"text": "first"}, {"text": "second"}])
+            self.assertEqual([json.loads(line) for line in result.stdout.splitlines()], [[0.0, 2.0], [1.0, 2.0]])
+            self.assertEqual(EmbeddingHandler.requests, [{"texts": ["first", "second"]}])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_nul_stdin_processes_batches_in_order(self):
+        self.sock.parent.mkdir(parents=True)
+        server = socketserver.UnixStreamServer(str(self.sock), EmbeddingHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        EmbeddingHandler.requests.clear()
+        try:
+            items = [f"item-{i}" for i in range(10001)]
+            result = self.run_cli("--json", "-", "-0", input="\0".join(items) + "\0")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(len(result.stdout.splitlines()), len(items))
+            self.assertEqual(len(EmbeddingHandler.requests), 2)
+            self.assertEqual(len(EmbeddingHandler.requests[0]["texts"]), 10000)
+            self.assertEqual(EmbeddingHandler.requests[1], {"text": items[-1]})
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_empty_nul_stdin_sends_no_request(self):
+        self.sock.parent.mkdir(parents=True)
+        server = socketserver.UnixStreamServer(str(self.sock), EmbeddingHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        EmbeddingHandler.requests.clear()
+        try:
+            result = self.run_cli("--json", "-", "-0", input="")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(EmbeddingHandler.requests, [])
         finally:
             server.shutdown()
             server.server_close()
