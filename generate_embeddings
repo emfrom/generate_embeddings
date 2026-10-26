@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 SOCKET_PATH = Path.home() / ".cache" / "generate_embeddings" / "daemon.sock"
-REQUEST_BATCH_SIZE = 64
+REQUEST_BATCH_SIZE = 512
 DAEMON_SCRIPT = Path(__file__).with_name("generate_embeddings.daemon")
 
 HELP = """Usage: ./generate_embeddings [OPTIONS] [TEXT...]
@@ -26,7 +26,7 @@ Unix-socket daemon, or start one with a 1-minute timeout if none is available.
 Options:
   -             Read text from stdin (cannot be combined with text arguments).
   --json        Output each embedding as a JSON array.
-  -0            With stdin, stream NUL-delimited strings in batches of 64; ignored in text mode.
+  -0            With stdin, stream NUL-delimited strings in batches of 512; ignored in text mode.
   --daemon [N]  Launch the daemon for N minutes (default: 0, unlimited).
   --            Treat following arguments literally as text.
   --help        Show this help.
@@ -128,6 +128,9 @@ def iter_nul_batches(stream):
             if len(batch) == REQUEST_BATCH_SIZE:
                 yield batch
                 batch = []
+        if batch:
+            yield batch
+            batch = []
     if remainder:
         batch.append(remainder.decode("utf-8"))
     if batch:

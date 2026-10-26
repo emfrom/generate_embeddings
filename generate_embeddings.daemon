@@ -12,15 +12,19 @@ import signal
 import socket
 import socketserver
 import sys
+import threading
 import time
 from pathlib import Path
 
 SOCKET_PATH = Path.home() / ".cache" / "generate_embeddings" / "daemon.sock"
 PID_PATH = SOCKET_PATH.with_suffix(".pid")
-MODEL = None
-GREEN = "\\033[32m"
-RED = "\\033[31m"
-RESET = "\\033[0m"
+CPU_MODEL = None
+GPU_MODEL = None
+GPU_MODEL_LOCK = threading.Lock()
+GPU_MODEL_LOADING = False
+GREEN = "\033[32m"
+RED = "\033[31m"
+RESET = "\033[0m"
 ACTION = "start"
 
 
@@ -31,9 +35,33 @@ def report(message, color=""):
     print(rendered, file=sys.stderr, flush=True)
 
 
+def load_gpu_model():
+    global GPU_MODEL, GPU_MODEL_LOADING
+    try:
+        from sentence_transformers import SentenceTransformer
+        model = SentenceTransformer("all-MiniLM-L6-v2", device="cuda")
+        GPU_MODEL = model
+    except Exception as error:
+        report(f"GPU model load failed; batches will use CPU: {error}", RED)
+    finally:
+        with GPU_MODEL_LOCK:
+            GPU_MODEL_LOADING = False
+
+
+def model_for_batch():
+    global GPU_MODEL_LOADING
+    with GPU_MODEL_LOCK:
+        if GPU_MODEL is not None:
+            return GPU_MODEL
+        if not GPU_MODEL_LOADING:
+            GPU_MODEL_LOADING = True
+            threading.Thread(target=load_gpu_model, daemon=True).start()
+        return CPU_MODEL
+
+
 class EmbeddingHandler(socketserver.StreamRequestHandler):
     def handle(self):
-        global MODEL
+        global CPU_MODEL, GPU_MODEL
         line = self.rfile.readline()
         if not line:
             return
@@ -43,11 +71,13 @@ class EmbeddingHandler(socketserver.StreamRequestHandler):
             texts = [request.get("text")] if scalar else request.get("texts")
             if not isinstance(texts, list) or not texts or any(not isinstance(text, str) for text in texts):
                 raise ValueError('request must contain a string "text" or nonempty string array "texts"')
-            if len(texts) > 64:
-                raise ValueError("batch exceeds maximum of 64 texts")
-            if MODEL is None:
+            if len(texts) > 512:
+                raise ValueError("batch exceeds maximum of 512 texts")
+            model = CPU_MODEL if scalar else model_for_batch()
+            if model is None:
                 raise RuntimeError("Embedding model is not loaded")
-            vectors = MODEL.encode(texts, batch_size=64, show_progress_bar=False)
+            batch_size = 16 if scalar or model is CPU_MODEL else 128
+            vectors = model.encode(texts, batch_size=batch_size, show_progress_bar=False)
             values = vectors.tolist() if hasattr(vectors, "tolist") else [list(vector) for vector in vectors]
             response = {"embedding": values[0]} if scalar else {"embeddings": values}
         except Exception as error:
@@ -58,8 +88,9 @@ class EmbeddingHandler(socketserver.StreamRequestHandler):
             pass
 
 
-class UnixServer(socketserver.UnixStreamServer):
+class UnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     allow_reuse_address = True
+    daemon_threads = True
 
 
 def stop_existing(force):
@@ -99,7 +130,7 @@ def stop_existing(force):
 
 
 def start(timeout_minutes, force):
-    global MODEL
+    global CPU_MODEL, GPU_MODEL
     SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
     stop_existing(force)
     pid = os.fork()
@@ -131,7 +162,7 @@ def start(timeout_minutes, force):
             for fd in (0, 1, 2):
                 os.dup2(null.fileno(), fd)
         from sentence_transformers import SentenceTransformer
-        MODEL = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
+        CPU_MODEL = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
         server = UnixServer(str(SOCKET_PATH), EmbeddingHandler)
         server.timeout = 1
         PID_PATH.write_text(str(os.getpid()))
